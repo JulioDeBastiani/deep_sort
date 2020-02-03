@@ -7,6 +7,10 @@ import os
 import cv2
 import numpy as np
 
+import json
+from uuid import uuid4
+import datetime
+
 from application_util import preprocessing
 from application_util import visualization
 from deep_sort import nn_matching
@@ -211,6 +215,129 @@ def run(sequence_dir, detection_file, output_file, min_confidence,
         print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1' % (
             row[0], row[1], row[2], row[3], row[4], row[5]),file=f)
 
+def custom_run(video, detection_file, output_video, output_tracks, min_confidence,
+        nms_max_overlap, min_detection_height, max_cosine_distance,
+        nn_budget, display):
+    """Run multi-target tracker on a particular sequence.
+
+    Parameters
+    ----------
+    video : str
+        video from which the detections were created
+    detection_file : str
+        Path to the detections file.
+    output_video : str
+        Path to the tracking output video.
+    output_file : str
+        Path to the tracking output file.
+    min_confidence : float
+        Detection confidence threshold. Disregard all detections that have
+        a confidence lower than this value.
+    nms_max_overlap: float
+        Maximum detection overlap (non-maxima suppression threshold).
+    min_detection_height : int
+        Detection height threshold. Disregard all detections that have
+        a height lower than this value.
+    max_cosine_distance : float
+        Gating threshold for cosine distance metric (object appearance).
+    nn_budget : Optional[int]
+        Maximum size of the appearance descriptor gallery. If None, no budget
+        is enforced.
+    display : bool
+        If True, show visualization of intermediate tracking results.
+
+    """
+
+    metric = nn_matching.NearestNeighborDistanceMetric(
+        "cosine", max_cosine_distance, nn_budget)
+    tracker = Tracker(metric, max_iou_distance=0.7, max_age=50, n_init=6)
+    cap = cv2.VideoCapture(video)
+    ret, frame = cap.read()
+    detections = np.load(detection_file)
+    frame_idx = 0
+
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'MP4V')
+    out_video = cv2.VideoWriter(output_video, fourcc, 30.0, (width, height))
+
+    out_track_ids = {}
+    time_delta = datetime.timedelta(milliseconds=33)
+    frame_time = datetime.datetime.utcnow()
+
+    with open(output_tracks, 'w') as out_tracks:
+        while ret:
+            frame_detections = detections[detections[:, 0] == frame_idx]
+            frame_detections = create_detections(frame_detections, frame_idx, min_detection_height)
+
+            # Run non-maxima suppression.
+            boxes = np.array([d.tlwh for d in frame_detections])
+            scores = np.array([d.confidence for d in frame_detections])
+            indices = preprocessing.non_max_suppression(
+                boxes, nms_max_overlap, scores)
+            frame_detections = [frame_detections[i] for i in indices]
+
+            # Update tracker.
+            tracker.predict()
+            tracker.update(frame_detections)
+
+            for det in frame_detections:
+                det = det.to_tlbr()
+                det = [int(x) for x in det]
+                # frame = cv2.rectangle(frame, det[0:2], det[2:2], (255, 0, 0), 2)
+                frame = cv2.rectangle(frame, (det[0], det[1]), (det[2], det[3]), (255, 0, 0), 2)
+
+            for track in tracker.tracks:
+                if not track.is_confirmed():
+                    continue
+                
+                track_id = track.track_id
+                bbox = track.to_tlbr()
+                bbox = [int(x) for x in bbox]
+                frame = cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255))
+                frame = cv2.putText(frame, str(track_id), (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_DUPLEX, 2, (0, 0, 255), 2)
+
+                if not track_id in out_track_ids.keys():
+                    instance_id = str(uuid4())
+                    out_track_ids[track_id] = instance_id
+
+                    instance = {
+                        "id": instance_id,
+                        "created_at": str(frame_time),
+                        "class": "person"
+                    }
+
+                    out_tracks.write(f"{track_id};inst;{json.dumps(instance)}\n")
+
+                instance_id = out_track_ids[track_id]
+
+                if track.time_since_update > 0:
+                    continue
+
+                detection = {
+                    "id": str(uuid4()),
+                    "instance_id": instance_id,
+                    "camera_id": "$$$camera_id$$$",
+                    "created_at": str(frame_time),
+                    "filename": None,
+                    "x": bbox[0] + ((bbox[2] - bbox[0]) // 2),
+                    "y": bbox[1] + ((bbox[3] - bbox[1]) // 2),
+                    "p1x": bbox[0],
+                    "p1y": bbox[1],
+                    "p2x": bbox[2],
+                    "p2y": bbox[3],
+                }
+
+                out_tracks.write(f"{track_id};det;{json.dumps(detection)}\n")
+
+            out_video.write(frame)
+            cv2.imshow("deep sort", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            frame_idx += 1
+            frame_time += time_delta
+            ret, frame = cap.read()
 
 def bool_string(input_string):
     if input_string not in {"True","False"}:
@@ -254,10 +381,48 @@ def parse_args():
         default=True, type=bool_string)
     return parser.parse_args()
 
+def custom_parse_args():
+    """ Parse command line arguments.
+    """
+    parser = argparse.ArgumentParser(description="Deep SORT")
+    parser.add_argument(
+        "--video", help="Path to MOTChallenge sequence directory",
+        default=None, required=True)
+    parser.add_argument(
+        "--detection_file", help="Path to custom detections.", default=None,
+        required=True)
+    parser.add_argument(
+        "--output_video", help="Path to the tracking output file. This file will"
+        " contain the tracking results on completion.",
+        default="/home/juju/repos/external/deep_sort/out/out.mp4")
+    parser.add_argument(
+        "--output_tracks", help="Path to the tracking output file",
+        default="/home/juju/repos/external/deep_sort/out/out.txt")
+    parser.add_argument(
+        "--min_confidence", help="Detection confidence threshold. Disregard "
+        "all detections that have a confidence lower than this value.",
+        default=0.8, type=float)
+    parser.add_argument(
+        "--min_detection_height", help="Threshold on the detection bounding "
+        "box height. Detections with height smaller than this value are "
+        "disregarded", default=0, type=int)
+    parser.add_argument(
+        "--nms_max_overlap",  help="Non-maxima suppression threshold: Maximum "
+        "detection overlap.", default=1.0, type=float)
+    parser.add_argument(
+        "--max_cosine_distance", help="Gating threshold for cosine distance "
+        "metric (object appearance).", type=float, default=0.2)
+    parser.add_argument(
+        "--nn_budget", help="Maximum size of the appearance descriptors "
+        "gallery. If None, no budget is enforced.", type=int, default=None)
+    parser.add_argument(
+        "--display", help="Show intermediate tracking results",
+        default=True, type=bool_string)
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    args = parse_args()
-    run(
-        args.sequence_dir, args.detection_file, args.output_file,
+    args = custom_parse_args()
+    custom_run(
+        args.video, args.detection_file, args.output_video, args.output_tracks,
         args.min_confidence, args.nms_max_overlap, args.min_detection_height,
         args.max_cosine_distance, args.nn_budget, args.display)

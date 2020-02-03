@@ -180,6 +180,67 @@ def generate_detections(encoder, mot_dir, output_dir, detection_dir=None):
         np.save(
             output_filename, np.asarray(detections_out), allow_pickle=False)
 
+def custom_generate_detections(encoder, output_file, detections_file, video):
+    """Generate detections with features.
+
+    Parameters
+    ----------
+    encoder : Callable[image, ndarray] -> ndarray
+        The encoder function takes as input a BGR color image and a matrix of
+        bounding boxes in format `(x, y, w, h)` and returns a matrix of
+        corresponding feature vectors.
+    output_dir
+        Path to the output directory. Will be created if it does not exist.
+    detections_file
+        file containing a list of detections in the format frame;x1;y1;x2;y2;score
+    video
+        video from which the detections were created
+
+    """
+
+    with open(detections_file) as file:
+        line = file.readline()
+        line = file.readline().strip('\n').split(';')
+        cap = cv2.VideoCapture(video)
+
+        if not cap.isOpened():
+            raise ValueError(f"video '{video}' not found")
+
+        count = 0
+        detections_out = []
+        ret, frame = cap.read()
+        while ret:
+            detections = []
+
+            if len(line) != 6:
+                break
+
+            while int(line[0]) == count:
+                box = [float(x) for x in line[1:6]]
+                box[2] = box[2] - box[0]
+                box[3] = box[3] - box[1]
+                box = [count, -1] + box
+                box += [-1, -1, -1]
+                detections.append(box)
+
+                line = file.readline().strip('\n').split(';')
+
+                if len(line) != 6:
+                    break
+
+            detections = np.array(detections, dtype=np.float)
+
+            if np.any(detections):
+                features = encoder(frame, detections[:, 2:6].copy())
+                detections_out += [np.r_[(det, feature)] for det, feature in zip(detections, features)]
+
+            print(f"frame            {count}")
+            print(f"total detections {len(detections_out)}")
+
+            count += 1
+            ret, frame = cap.read()
+
+        np.save(output_file, np.asarray(detections_out), allow_pickle=False)
 
 def parse_args():
     """Parse command line arguments.
@@ -190,8 +251,7 @@ def parse_args():
         default="resources/networks/mars-small128.pb",
         help="Path to freezed inference graph protobuf.")
     parser.add_argument(
-        "--mot_dir", help="Path to MOTChallenge directory (train or test)",
-        required=True)
+        "--mot_dir", help="Path to MOTChallenge directory (train or test)")
     parser.add_argument(
         "--detection_dir", help="Path to custom detections. Defaults to "
         "standard MOT detections Directory structure should be the default "
@@ -199,14 +259,27 @@ def parse_args():
     parser.add_argument(
         "--output_dir", help="Output directory. Will be created if it does not"
         " exist.", default="detections")
+
+    parser.add_argument(
+        "--detections_file", help="detections file",
+        required=True)
+    parser.add_argument(
+        "--video", help="video from which the detections were generated",
+        required=True)
+    parser.add_argument(
+        "--output_file", help="Output file"
+        " exist.", default="detections/out.npy")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     encoder = create_box_encoder(args.model, batch_size=32)
-    generate_detections(encoder, args.mot_dir, args.output_dir,
-                        args.detection_dir)
+    # generate_detections(encoder, args.mot_dir, args.output_dir,
+    #                     args.detection_dir)
+
+    custom_generate_detections(encoder, args.output_file, args.detections_file, args.video)
 
 
 if __name__ == "__main__":
